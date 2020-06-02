@@ -1,0 +1,10 @@
+#include "../vis_milk2/resource.h"
+
+#include "windows.h"
+
+IDI_PLUGIN_ICON ICON "../vis_milk2/plugin_icon.ico"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 0,1,0,0
+BEGIN
+END
