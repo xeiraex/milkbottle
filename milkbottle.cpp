@@ -1,8 +1,10 @@
 #include <deque>
 #include <windows.h>
 #include <avrt.h>
+#include <atlbase.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
+#include <audiopolicy.h>
 #include <functiondiscoverykeys_devpkey.h>
 
 #include "wa_ipc.h"
@@ -254,11 +256,133 @@ public:
 	}
 };
 
+class SessionEvents : public IAudioSessionEvents {
+
+private:
+	LONG rc;
+	~SessionEvents() {}
+
+public:
+	SessionEvents() :
+	  rc(1) {}
+
+	  ULONG STDMETHODCALLTYPE AddRef() {
+		  return InterlockedIncrement(&rc);
+	  }
+
+	  ULONG STDMETHODCALLTYPE Release() {
+		  ULONG rc = InterlockedDecrement(&this->rc);
+		  if (rc == 0) {
+			  delete this;
+		  }
+		  return rc;
+	  }
+
+	  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) {
+		  if (IID_IUnknown == riid) {
+			  AddRef();
+			  *ppv = static_cast<IUnknown*>(this);
+			  return S_OK;
+		  }
+		  else if (__uuidof(IAudioSessionEvents) == riid) {
+			  AddRef();
+			  *ppv = static_cast<IAudioSessionEvents*>(this);
+			  return S_OK;
+		  }
+		  else {
+			  *ppv = nullptr;
+			  return E_NOINTERFACE;
+		  }
+	  }
+
+	  HRESULT STDMETHODCALLTYPE OnDisplayNameChanged(LPCWSTR NewDisplayName, LPCGUID EventContext) {
+		  return S_OK;
+	  }
+
+	  HRESULT STDMETHODCALLTYPE OnIconPathChanged(LPCWSTR NewIconPath, LPCGUID EventContext) {
+		  return S_OK;
+	  }
+
+	  HRESULT STDMETHODCALLTYPE OnSimpleVolumeChanged(float NewVolume, BOOL NewMute, LPCGUID EventContext) {
+		  return S_OK;
+	  }
+
+	  HRESULT STDMETHODCALLTYPE OnChannelVolumeChanged(DWORD ChannelCount, float NewChannelVolumeArray[], DWORD ChangedChannel, LPCGUID EventContext) {
+		  return S_OK;
+	  }
+
+	  HRESULT STDMETHODCALLTYPE OnGroupingParamChanged(LPCGUID NewGroupingParam, LPCGUID EventContext) {
+		  return S_OK;
+	  }
+
+	  HRESULT STDMETHODCALLTYPE OnStateChanged(AudioSessionState NewState) {
+		  if (NewState == AudioSessionStateInactive) deviceChanged = true;
+		  return S_OK;
+	  }
+
+	  HRESULT STDMETHODCALLTYPE OnSessionDisconnected(AudioSessionDisconnectReason DisconnectReason) {
+		  return S_OK;
+	  }
+};
+
+SessionEvents *sessionEvents = new SessionEvents();
+
+class SessionNotification : public IAudioSessionNotification {
+
+private:
+	LONG rc;
+	~SessionNotification() {}
+
+public:
+	SessionNotification() : rc(1) {}
+
+	ULONG STDMETHODCALLTYPE AddRef() {
+		return InterlockedIncrement(&rc);
+	}
+
+	ULONG STDMETHODCALLTYPE Release() {
+		ULONG rc = InterlockedDecrement(&this->rc);
+		if (rc == 0)
+			delete this;
+		return rc;
+	}
+
+	HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) {
+		if (IID_IUnknown == riid) {
+			AddRef();
+			*ppv = static_cast<IUnknown*>(this);
+			return S_OK;
+		}
+		else if (__uuidof(IAudioSessionNotification) == riid) {
+			AddRef();
+			*ppv = static_cast<IAudioSessionNotification*>(this);
+			return S_OK;
+		}
+		else {
+			*ppv = nullptr;
+			return E_NOINTERFACE;
+		}
+	}
+
+	HRESULT STDMETHODCALLTYPE OnSessionCreated(IAudioSessionControl *newSession) {
+		HRESULT hr = S_OK;
+		if (newSession) {
+			newSession->AddRef();
+			newSession->RegisterAudioSessionNotification(sessionEvents);
+		}
+		return hr;
+	}
+};
+
 long audioLoop(IMMDeviceEnumerator *pMMDeviceEnumerator, bool loopback) {
 	HRESULT hr = S_OK;
 	noAudio = false;
 
 	IMMDevice *m_pMMDevice = NULL;
+	CComPtr<IAudioSessionManager2> manager = NULL;
+	CComPtr<IAudioSessionEnumerator> sessions = NULL;
+	CComPtr<IAudioSessionControl> control;
+	SessionNotification* notification = new SessionNotification;
 	IPropertyStore *pPropertyStore = NULL;
 	PROPVARIANT pv;
 	IAudioClient *pAudioClient = NULL;
@@ -270,14 +394,15 @@ long audioLoop(IMMDeviceEnumerator *pMMDeviceEnumerator, bool loopback) {
 	WWMFResampler resampler;
 	WWMFSampleData sampleData;
 
+	int sessionCount = 0;
 	MSG msg;
 	msg.message = WM_NULL;
 	UINT32 nPasses = 0;
 	UINT32 pnFrames = 0;
-	UINT32 nNextPacketSize;
-	BYTE *pData;
-	UINT32 nNumFramesToRead;
-	DWORD dwFlags;
+	UINT32 nNextPacketSize = 0;
+	BYTE *pData = NULL;
+	UINT32 nNumFramesToRead = 0;
+	DWORD dwFlags = 0;
 	std::deque<byte> bufferLeft;
 	std::deque<byte> bufferRight;
 
@@ -292,6 +417,21 @@ long audioLoop(IMMDeviceEnumerator *pMMDeviceEnumerator, bool loopback) {
 		noAudio = true;
 		goto cleanup;
 	}
+
+	m_pMMDevice->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&manager));
+	manager->RegisterSessionNotification(notification);
+	hr = manager->GetSessionEnumerator(&sessions);
+	if (FAILED(hr)) {
+		ERR(L"IAudioSessionManager2::GetSessionEnumerator failed: hr = 0x%08x", hr);
+	} else {
+		sessions->GetCount(&sessionCount);
+		for(int s = 0; s < sessionCount; s++) {
+			sessions->GetSession(s, &control);
+			control->RegisterAudioSessionNotification(sessionEvents);
+			SafeRelease(&control);
+		}
+	}
+	SafeRelease(&sessions);
 
 	hr = m_pMMDevice->OpenPropertyStore(STGM_READ, &pPropertyStore);
 	if (FAILED(hr)) {
@@ -330,8 +470,6 @@ long audioLoop(IMMDeviceEnumerator *pMMDeviceEnumerator, bool loopback) {
 		goto cleanup;
 	}
 
-	LOG(L"Stream Sample Rate: %u", pwfx->nSamplesPerSec);
-
 	inputFormat.sampleFormat = WWMFBitFormatFloat;
 	inputFormat.nChannels = pwfx->nChannels;
 	inputFormat.sampleRate = pwfx->nSamplesPerSec;
@@ -367,7 +505,6 @@ long audioLoop(IMMDeviceEnumerator *pMMDeviceEnumerator, bool loopback) {
 	}
 
 	if (useResampler) {
-		LOG(L"Using Audio Resampler DSP");
 		hr = resampler.Initialize(inputFormat, outputFormat, 5);
 		if (FAILED(hr)) {
 			ERR(L"WWMFResampler::Initialize failed: hr = 0x%08x", hr);
@@ -415,12 +552,6 @@ long audioLoop(IMMDeviceEnumerator *pMMDeviceEnumerator, bool loopback) {
 					goto cleanup;
 				}
 
-				if (nNumFramesToRead == 0) {
-					ERR(L"IAudioCaptureClient::GetBuffer said to read 0 frames on pass %u after %u frames", nPasses, pnFrames);
-					pAudioClient->Stop();
-					goto cleanup;
-				}
-
 				pnFrames += nNumFramesToRead;
 
 				if (dwFlags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) {
@@ -454,17 +585,17 @@ long audioLoop(IMMDeviceEnumerator *pMMDeviceEnumerator, bool loopback) {
 						bufferRight.push_back(sampleData.data[i + 1] - 128);
 					}
 
-					hr = pAudioCaptureClient->ReleaseBuffer(nNumFramesToRead);
-					if (FAILED(hr)) {
-						ERR(L"IAudioCaptureClient::ReleaseBuffer failed on pass %u after %u frames: hr = 0x%08x", nPasses, pnFrames, hr);
-						pAudioClient->Stop();
-						goto cleanup;
-					}
-
 					if (useResampler)
 						sampleData.Release();
 					else
 						sampleData.Forget();
+				}
+
+				hr = pAudioCaptureClient->ReleaseBuffer(nNumFramesToRead);
+				if (FAILED(hr)) {
+					ERR(L"IAudioCaptureClient::ReleaseBuffer failed on pass %u after %u frames: hr = 0x%08x", nPasses, pnFrames, hr);
+					pAudioClient->Stop();
+					goto cleanup;
 				}
 
 				hr = pAudioCaptureClient->GetNextPacketSize(&nNextPacketSize);
@@ -472,22 +603,22 @@ long audioLoop(IMMDeviceEnumerator *pMMDeviceEnumerator, bool loopback) {
 
 			if (!SUCCEEDED(hr)) {
 				ERR(L"IAudioCaptureClient::GetNextPacketSize failed on pass %u after %u frames: hr = 0x%08x", nPasses, pnFrames, hr);
-				deviceChanged = true;
 				pAudioClient->Stop();
-			} else {
-				if (bufferLeft.size() >= 576) {
-					for (int i = 0; i < 576; ++i) {
-						chunk[i] = bufferLeft.front();
-						bufferLeft.pop_front();
-						chunk[576+i] = bufferRight.front();
-						bufferRight.pop_front();
-					}
+				goto cleanup;
+			}
+			if (bufferLeft.size() >= 576) {
+				for (int i = 0; i < 576; ++i) {
+					chunk[i] = bufferLeft.front();
+					bufferLeft.pop_front();
+					chunk[576+i] = bufferRight.front();
+					bufferRight.pop_front();
 				}
 				memcpy(milkdropModule->waveformData, chunk, 2*576);
-				milkdropModule->Render(milkdropModule);
 			}
+			milkdropModule->Render(milkdropModule);
 		}
 	}
+	pAudioClient->Stop();
 
 cleanup:
 	if (useResampler) resampler.Finalize();
@@ -497,6 +628,23 @@ cleanup:
 	audioDeviceName = noAudioString;
 	if (&pv) PropVariantClear(&pv);
 	SafeRelease(&pPropertyStore);
+	if (manager) {
+		hr = manager->GetSessionEnumerator(&sessions);
+		if (FAILED(hr)) {
+			ERR(L"IAudioSessionManager2::GetSessionEnumerator failed: hr = 0x%08x", hr);
+		} else {
+			sessions->GetCount(&sessionCount);
+			for(int s = 0; s < sessionCount; s++) {
+				sessions->GetSession(s, &control);
+				control->RegisterAudioSessionNotification(sessionEvents);
+				SafeRelease(&control);
+			}
+		}
+		SafeRelease(&sessions);
+		manager->UnregisterSessionNotification(notification);
+	}
+	SafeRelease(&notification);
+	SafeRelease(&manager);
 	SafeRelease(&m_pMMDevice);
 
 	return hr;
@@ -521,14 +669,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
 	if (!RegisterClass(&winampClass)) {
 		ERR(L"RegisterClass failed");
-		MessageBox(NULL,"RegisterClass failed.", "Error", 0);
+		MessageBox(NULL, "RegisterClass failed.", "Error", 0);
 		return 1;
 	}
 
 	HWND winampWindow = CreateWindow(winampClassName, winampWindowName, 0, 0, 0, 0, 0, NULL, NULL, hInstance, NULL);
 	if (winampWindow == NULL) {
 		ERR(L"CreateWindow failed");
-		MessageBox(NULL,"CreateWindow failed.", "Error", 0);
+		MessageBox(NULL, "CreateWindow failed.", "Error", 0);
 		return 1;
 	}
 
@@ -576,7 +724,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 	milkdropModule->hwndParent = winampWindow;
 
 	HRESULT hr;
-	hr = CoInitialize(NULL);
+	hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
 	if (FAILED(hr)) {
 		ERR(L"CoInitialize failed: hr = 0x%08x", hr);
 		return -__LINE__;
