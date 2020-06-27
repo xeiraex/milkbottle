@@ -130,24 +130,27 @@ public:
 static ApiService apiService;
 #undef CBCLASS
 
-#define ID_START 1
-#define ID_STOP 2
-#define ID_CONFIG 3
-#define ID_EXIT 4
-#define STATE_RUNNING 1
-#define STATE_STOPPED 2
-#define STATE_CONFIG 3
-#define STATE_EXIT 4
+#define ID_START 10001
+#define ID_STOP 10002
+#define ID_CONFIG 10003
+#define ID_EXIT 10004
+#define STATE_RUNNING 10001
+#define STATE_STOPPED 10002
+#define STATE_CONFIG 10003
+#define STATE_EXIT 10004
 
-HWND mainWindow;
-HMENU hMenu;
 winampVisModule *milkdropModule;
-LPWSTR noAudioString = L"No Suitable Device or Resampler Missing";
-LPWSTR audioDeviceName = noAudioString;
+IMMDeviceEnumerator *pMMDeviceEnumerator = NULL;
+LPWSTR noSuitableDev = L"No Suitable Device or Resampler Missing";
+LPWSTR selectedDevMissing = L"Selected Device Missing or Resampler Missing";
+LPWSTR audioDeviceName = noSuitableDev;
 int state = STATE_RUNNING;
 int previousState = STATE_RUNNING;
 bool deviceChanged;
 bool noAudio;
+UINT numDevices = 0;
+std::deque<LPWSTR> deviceList;
+int selectedDevice = 0;
 
 BYTE* chunk = new BYTE[2*576];
 
@@ -191,13 +194,49 @@ LRESULT WINAPI MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			POINT pt;
 			GetCursorPos(&pt);
 			HMENU hMenu = CreatePopupMenu();
-			InsertMenu(hMenu, 0, MF_BYPOSITION | MF_STRING, ID_EXIT, "Quit");
-			InsertMenu(hMenu, 0, MF_BYPOSITION | MF_STRING, ID_CONFIG, "Configure");
-			if (state == STATE_RUNNING)
-				InsertMenu(hMenu, 0, MF_BYPOSITION | MF_STRING, ID_STOP, "Stop");
-			else if (state == STATE_STOPPED)
-				InsertMenu(hMenu, 0, MF_BYPOSITION | MF_STRING, ID_START, "Start");
+			if (state == STATE_STOPPED)
+				InsertMenu(hMenu, -1, MF_BYPOSITION | MF_STRING, ID_START, "Start");
+			else if (state == STATE_RUNNING)
+				InsertMenu(hMenu, -1, MF_BYPOSITION | MF_STRING, ID_STOP, "Stop");
+
+			HMENU hSubmenu = CreatePopupMenu();
+			InsertMenuW(hSubmenu, -1, MF_BYPOSITION | MF_STRING, 0, L"Use the default device");
+			InsertMenuW(hSubmenu, -1, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
+			IMMDeviceCollection *pCollection = NULL;
+			if (pMMDeviceEnumerator &&
+				SUCCEEDED(pMMDeviceEnumerator->EnumAudioEndpoints(eAll, DEVICE_STATE_ACTIVE | DEVICE_STATE_UNPLUGGED, &pCollection)) &&
+				SUCCEEDED(pCollection->GetCount(&numDevices)) &&
+				numDevices > 0) {
+					IMMDevice *pEndpoint = NULL;
+					LPWSTR pwszID = NULL;
+					IPropertyStore *pProps = NULL;
+					PROPVARIANT varName;
+					PropVariantInit(&varName);
+					for (UINT i = 0; i < deviceList.size(); i++) if (deviceList[i]) CoTaskMemFree(deviceList[i]);
+					deviceList.clear();
+					for (UINT i = 0; i < numDevices; i++) {
+						if (SUCCEEDED(pCollection->Item(i, &pEndpoint)) &&
+							SUCCEEDED(pEndpoint->GetId(&pwszID)) &&
+							SUCCEEDED(pEndpoint->OpenPropertyStore(STGM_READ, &pProps)) &&
+							SUCCEEDED(pProps->GetValue(PKEY_Device_FriendlyName, &varName))) {
+								deviceList.push_back(pwszID);
+								InsertMenuW(hSubmenu, -1, MF_BYPOSITION | MF_STRING, i + 1, varName.pwszVal);
+						} else {
+							deviceList.push_back(L"");
+						}
+						PropVariantClear(&varName);
+						SafeRelease(&pProps);
+						SafeRelease(&pEndpoint);
+					}
+			}
+			SafeRelease(&pCollection);
+			InsertMenu(hMenu, -1, MF_BYPOSITION | MF_POPUP | MF_STRING, (UINT_PTR)hSubmenu, "Select Device");
+
+			InsertMenu(hMenu, -1, MF_BYPOSITION | MF_STRING, ID_CONFIG, "Configure");
+			InsertMenu(hMenu, -1, MF_BYPOSITION | MF_STRING, ID_EXIT, "Quit");
+			SetForegroundWindow(hWnd);
 			TrackPopupMenu(hMenu, TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pt.x, pt.y, 0, hWnd, NULL);
+			DestroyMenu(hMenu);
 		}
 		break;
 	case WM_COMMAND:
@@ -219,6 +258,11 @@ LRESULT WINAPI MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		case LOWORD(ID_EXIT):
 			state = STATE_EXIT;
 			break;
+		default:
+			if (wParam >= 0 && wParam <= numDevices) {
+				selectedDevice = wParam;
+				deviceChanged = true;
+			}
 		}
 		break;
 	}
@@ -406,9 +450,14 @@ long audioLoop(IMMDeviceEnumerator *pMMDeviceEnumerator, bool loopback) {
 	std::deque<byte> bufferLeft;
 	std::deque<byte> bufferRight;
 
-	hr = pMMDeviceEnumerator->GetDefaultAudioEndpoint(loopback ? eRender : eCapture, eConsole, &m_pMMDevice);
+	if (selectedDevice > 0) {
+		hr = pMMDeviceEnumerator->GetDevice(deviceList[selectedDevice - 1], &m_pMMDevice);
+	} else {
+		hr = pMMDeviceEnumerator->GetDefaultAudioEndpoint(loopback ? eRender : eCapture, eConsole, &m_pMMDevice);
+	}
+
 	if (FAILED(hr)) {
-		ERR(L"IMMDeviceEnumerator::GetDefaultAudioEndpoint failed: hr = 0x%08x", hr);
+		ERR(L"IMMDeviceEnumerator::%s failed: hr = 0x%08x", selectedDevice > 0 ? L"GetDevice" : L"GetDefaultAudioEndpoint", hr);
 		noAudio = true;
 		goto cleanup;
 	}
@@ -625,7 +674,7 @@ cleanup:
 	SafeRelease(&pAudioCaptureClient);
 	if (pwfx) CoTaskMemFree(pwfx);
 	SafeRelease(&pAudioClient);
-	audioDeviceName = noAudioString;
+	audioDeviceName = selectedDevice > 0 ? selectedDevMissing : noSuitableDev;
 	if (&pv) PropVariantClear(&pv);
 	SafeRelease(&pPropertyStore);
 	if (manager) {
@@ -636,7 +685,7 @@ cleanup:
 			sessions->GetCount(&sessionCount);
 			for(int s = 0; s < sessionCount; s++) {
 				sessions->GetSession(s, &control);
-				control->RegisterAudioSessionNotification(sessionEvents);
+				control->UnregisterAudioSessionNotification(sessionEvents);
 				SafeRelease(&control);
 			}
 		}
@@ -701,7 +750,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 		return 1;
 	}
 
-	mainWindow = CreateWindow(mainWindowName, NULL, 0, 0, 0, 0, 0, NULL, NULL, hInstance, NULL);
+	HWND mainWindow = CreateWindow(mainWindowName, NULL, 0, 0, 0, 0, 0, NULL, NULL, hInstance, NULL);
 	if (mainWindow == NULL) {
 		ERR(L"CreateWindow failed");
 		MessageBox(NULL,"CreateWindow failed.", "Error", 0);
@@ -730,20 +779,23 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 		return -__LINE__;
 	}
 
+	hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&pMMDeviceEnumerator);
+	if (FAILED(hr)) {
+		ERR(L"CoCreateInstance(IMMDeviceEnumerator) failed: hr = 0x%08x", hr);
+		pMMDeviceEnumerator = NULL;
+	}
+
 	MSG msg;
 	msg.message = WM_NULL;
-	IMMDeviceEnumerator *pMMDeviceEnumerator = NULL;
 	MMNotificationClient notificationClient;
 	while (state != STATE_EXIT) {
 		if (state == STATE_RUNNING)	{
 			milkdropModule->Init(milkdropModule);
 			while(state == STATE_RUNNING) {
-				noAudio = false;
-				hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&pMMDeviceEnumerator);
-				if (FAILED(hr)) {
-					ERR(L"CoCreateInstance(IMMDeviceEnumerator) failed: hr = 0x%08x", hr);
+				if (!pMMDeviceEnumerator) {
 					noAudio = true;
 				} else {
+					noAudio = false;
 					pMMDeviceEnumerator->RegisterEndpointNotificationCallback(&notificationClient);
 					deviceChanged = false;
 					audioLoop(pMMDeviceEnumerator, true);
@@ -769,7 +821,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 				}
 				if (pMMDeviceEnumerator) {
 					pMMDeviceEnumerator->UnregisterEndpointNotificationCallback(&notificationClient);
-					SafeRelease(&pMMDeviceEnumerator);
 				}
 			}
 			milkdropModule->Quit(milkdropModule);
@@ -787,6 +838,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 		}
 	}
 
+	SafeRelease(&pMMDeviceEnumerator);
 	Shell_NotifyIcon(NIM_DELETE, &nid);
 	delete[] chunk;
 	CoUninitialize();
